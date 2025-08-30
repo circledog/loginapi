@@ -27,41 +27,92 @@ def _b64_api_key(api_key_id: str, api_key_secret: str) -> str:
     return "ApiKey " + base64.b64encode(f"{api_key_id}:{api_key_secret}".encode()).decode()
 
 async def _es_password_grant(client: httpx.AsyncClient, username: str, password: str) -> str:
-    r = await client.post(f"{settings.ES_URL}/_security/oauth2/token",
-                          json={"grant_type":"password","username":username,"password":password})
+    r = await client.post(
+        f"{settings.ES_URL}/_security/oauth2/token",
+        json={"grant_type": "password", "username": username, "password": password},
+    )
     if r.status_code != 200:
-        raise HTTPException(401, "Elasticsearch authentication failed")
-    return r.json()["access_token"]
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise HTTPException(status_code=401, detail={"stage": "es_password_grant", "response": detail})
+    return r.json().get("access_token")
 
 async def _es_grant_api_key(client: httpx.AsyncClient, access_token: str, username: str):
-    r = await client.post(f"{settings.ES_URL}/_security/api_key/grant", json={
-        "grant_type": "access_token",
-        "access_token": access_token,
-        "api_key": {
-            "name": f"ui-{username}-{int(time.time())}",
-            "expiration": "7d",
-            "role_descriptors": {
-                "ui_reader": {
-                    "cluster": ["monitor"],
-                    "index": [
-                        {"names": ["logs-*"], "privileges": ["read", "view_index_metadata"]}
-                    ]
-                }
-            }
-        }
-    })
+    r = await client.post(
+        f"{settings.ES_URL}/_security/api_key/grant",
+        json={
+            "grant_type": "access_token",
+            "access_token": access_token,
+            "api_key": {
+                "name": f"ui-{username}-{int(time.time())}",
+                "expiration": "7d",
+                "role_descriptors": {
+                    "ui_reader": {
+                        "cluster": ["monitor"],
+                        "index": [
+                            {"names": ["logs-*"], "privileges": ["read", "view_index_metadata"]}
+                        ],
+                    }
+                },
+            },
+        },
+    )
     if r.status_code != 200:
-        raise HTTPException(500, f"Grant API Key failed: {r.text}")
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise HTTPException(status_code=502, detail={"stage": "es_grant_api_key", "response": detail})
     return r.json()  # {id, api_key, name, expiration, encoded}
 
+
+async def _es_api_key_via_password(client: httpx.AsyncClient, username: str, password: str, display_user: str):
+    # 直接用 Basic Auth 建立 API Key（等效於用 UI 手動建立）；避免使用 token API。
+    auth_header = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+    payload = {
+        "name": f"ui-{display_user}-{int(time.time())}",
+        "expiration": "7d",
+        "role_descriptors": {
+            "ui_reader": {
+                "cluster": ["monitor"],
+                "index": [{"names": ["logs-*"], "privileges": ["read", "view_index_metadata"]}],
+            }
+        },
+    }
+    r = await client.post(
+        f"{settings.ES_URL}/_security/api_key",
+        headers={"Authorization": auth_header},
+        json=payload,
+    )
+    if r.status_code != 200:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise HTTPException(status_code=401, detail={"stage": "es_basic_create_api_key", "response": detail})
+    return r.json()
+
 async def _kibana_basic_login(client: httpx.AsyncClient, username: str, password: str):
-    r = await client.post(f"{settings.KBN_URL}/internal/security/login",
-                          json={"providerType":"basic","providerName":"basic",
-                                "currentURL":"", "params":{"username":username,"password":password}},
-                          follow_redirects=False)
+    r = await client.post(
+        f"{settings.KBN_URL}/internal/security/login",
+        json={
+            "providerType": "basic",
+            "providerName": settings.KBN_PROVIDER_NAME,
+            "currentURL": f"{settings.KBN_URL}/login",
+            "params": {"username": username, "password": password},
+        },
+        headers={"kbn-xsrf": "true"},
+        follow_redirects=False,
+    )
     # 200/204 視版本而定；重點是要拿 set-cookie
     if r.status_code not in (200, 204):
-        raise HTTPException(500, f"Kibana login failed: {r.text}")
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise HTTPException(status_code=401, detail={"stage": "kibana_login", "response": detail})
     return r
 
 
@@ -72,8 +123,12 @@ async def healthz():
 @app.post("/api/login")
 async def login(body: LoginBody, response: Response):
     async with httpx.AsyncClient(verify=settings.VERIFY_TLS, timeout=15) as client:
-        access_token = await _es_password_grant(client, body.username, body.password)
-        api_key = await _es_grant_api_key(client, access_token, body.username)
+        # 兩種取得 API Key 的方式：token（預設）或 basic 密碼
+        if settings.ES_GRANT_FLOW.lower() == "password":
+            api_key = await _es_api_key_via_password(client, body.username, body.password, body.username)
+        else:
+            access_token = await _es_password_grant(client, body.username, body.password)
+            api_key = await _es_grant_api_key(client, access_token, body.username)
         kbn = await _kibana_basic_login(client, body.username, body.password)
 
     # 將 Kibana 的 Set-Cookie 回傳給瀏覽器（需要同網域或同站 Ingress 才能被瀏覽器收下）
