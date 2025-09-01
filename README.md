@@ -111,37 +111,14 @@ mkcert localhost 127.0.0.1
 
 - 將無 key 後綴的檔案改名為 `dev.crt`
 - 將帶 key 後綴的檔案改名為 `dev.key`
-- 建立前端專案目錄 `coreui-kibana/cert/`，把兩個檔案放入其中（路徑可依你的前端專案調整）
+- 建立前端專案目錄 `coreui-kibana/cert/`，把兩個檔案放入其中
 
 4) 啟動前端（Vite）為 HTTPS
 
 ```powershell
 # PowerShell 設定環境變數後啟動
-$env:VITE_HTTPS = '1'
-npm run dev
+VITE_HTTPS=1 npm run dev
 ```
-
-可選：若使用 Vite 內建設定檔指定憑證，於前端 `vite.config.ts` 中設定：
-
-```ts
-import { defineConfig } from 'vite'
-import vue from '@vitejs/plugin-vue'
-import fs from 'node:fs'
-
-export default defineConfig({
-  plugins: [vue()],
-  server: {
-    https: process.env.VITE_HTTPS === '1' ? {
-      key: fs.readFileSync('cert/dev.key'),
-      cert: fs.readFileSync('cert/dev.crt'),
-    } : false,
-    // 也可在這裡設定代理到後端 API
-    // proxy: { '/api': 'http://127.0.0.1:8000', '/kbn': 'http://127.0.0.1:8000' }
-  }
-})
-```
-
----
 
 ## 環境變數設定
 服務透過環境變數讀取設定（見 `settings.py`）。以下為可用參數：
