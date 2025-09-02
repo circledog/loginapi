@@ -19,6 +19,11 @@ app.add_middleware(
         "https://localhost:3000",
         "http://127.0.0.1:3000",
         "https://127.0.0.1:3000",
+    # 開發時常見的另一個埠
+    "http://localhost:3001",
+    "https://localhost:3001",
+    "http://127.0.0.1:3001",
+    "https://127.0.0.1:3001",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -101,25 +106,51 @@ async def _es_api_key_via_password(client: httpx.AsyncClient, username: str, pas
     return r.json()
 
 async def _kibana_basic_login(client: httpx.AsyncClient, username: str, password: str):
-    r = await client.post(
-        f"{settings.KBN_URL}/internal/security/login",
-        json={
-            "providerType": "basic",
-            "providerName": settings.KBN_PROVIDER_NAME,
-            "currentURL": f"{settings.KBN_URL}/login",
-            "params": {"username": username, "password": password},
-        },
-        headers={"kbn-xsrf": "true"},
-        follow_redirects=False,
-    )
-    # 200/204 視版本而定；重點是要拿 set-cookie
-    if r.status_code not in (200, 204):
+    """
+    以 basic provider 對 Kibana 登入，並對常見 providerName 進行自動 fallback：
+    - 優先使用 settings.KBN_PROVIDER_NAME（若有指定）
+    - 其後嘗試 "basic"、"basic1"（ECK 常見）、"cloud-basic"（Elastic Cloud）
+    """
+    tried = []
+    # 準備候選 providerName，並去重
+    candidates = []
+    if settings.KBN_PROVIDER_NAME:
+        candidates.append(settings.KBN_PROVIDER_NAME)
+    candidates.extend(["basic", "basic1", "cloud-basic"])
+    seen = set()
+    candidates = [p for p in candidates if not (p in seen or seen.add(p))]
+
+    last_error_text = None
+    for provider in candidates:
+        tried.append(provider)
+        r = await client.post(
+            f"{settings.KBN_URL}/internal/security/login",
+            json={
+                "providerType": "basic",
+                "providerName": provider,
+                "currentURL": f"{settings.KBN_URL}/login",
+                "params": {"username": username, "password": password},
+            },
+            headers={"kbn-xsrf": "true"},
+            follow_redirects=False,
+        )
+        if r.status_code in (200, 204):
+            return r
+        # 累積錯誤資訊，但不立刻拋出，讓後續 providerName 有機會成功
         try:
-            detail = r.json()
+            last_error_text = r.json()
         except Exception:
-            detail = r.text
-        raise HTTPException(status_code=401, detail={"stage": "kibana_login", "response": detail})
-    return r
+            last_error_text = r.text
+
+    # 全部嘗試失敗才回傳 401
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "stage": "kibana_login",
+            "tried_providers": tried,
+            "response": last_error_text,
+        },
+    )
 
 
 @app.get("/healthz")
@@ -151,8 +182,8 @@ async def login(body: LoginBody, response: Response, request: Request):
     # 針對本地開發：移除 Domain（變成 host-only），若 scheme!=https 則移除 Secure，確保 cookie 會在 HTTP 被瀏覽器帶上
     # 嘗試從代理標頭判斷原始瀏覽器協定（Vite 代理到後端時，request.url.scheme 仍為 http）
     scheme = request.headers.get("x-forwarded-proto") or ("https" if request.headers.get("origin", "").startswith("https://") else request.url.scheme)
-    for c in set_cookies:
-        response.headers.append("set-cookie", _rewrite_set_cookie(c, new_domain=None, force_insecure=(scheme != "https")))
+    for c in _dedupe_and_rewrite_set_cookies(set_cookies, new_domain=None, force_insecure=(scheme != "https")):
+        response.headers.append("set-cookie", c)
 
     # 安全方案A：發「自家 JWT」給前端；ES API Key 只存在伺服器
     if settings.ISSUE_SERVER_JWT:
@@ -327,6 +358,49 @@ def _rewrite_set_cookie(cookie_header: str, new_domain: Optional[str], force_ins
     return '; '.join(out)
 
 
+def _dedupe_and_rewrite_set_cookies(set_cookie_headers, new_domain: Optional[str], force_insecure: bool = False):
+    """
+    將上游多個 Set-Cookie 以 cookie 名稱去重，保留最後一次出現者，
+    並用 _rewrite_set_cookie 正規化每一個條目。
+    名稱比對採小寫，避免大小寫差異造成重複。
+    """
+    if not set_cookie_headers:
+        return []
+    keep_by_name = {}
+    for idx, c in enumerate(set_cookie_headers):
+        try:
+            first = c.split(';', 1)[0]
+            name = first.split('=', 1)[0].strip().lower()
+            keep_by_name[name] = (idx, c)
+        except Exception:
+            keep_by_name[f"__raw__{idx}"] = (idx, c)
+    # 依最後出現的索引排序
+    items = sorted(keep_by_name.values(), key=lambda t: t[0])
+    out = []
+    for _, raw in items:
+        out.append(_rewrite_set_cookie(raw, new_domain=new_domain, force_insecure=force_insecure))
+    return out
+
+
+def _space_prefix_from_request(request: Request) -> str:
+    """從 Referer 嘗試取得目前 Kibana Space 的 basePath '/s/{spaceId}'。
+    找不到則回傳空字串代表 Default Space。
+    支援兩種常見形式：
+    - /kbn/s/{space}/...
+    - /kbn/{hash}/s/{space}/...
+    僅解析我們自身代理位址下的參照（/kbn/...）。
+    """
+    try:
+        ref = request.headers.get("referer", "")
+        # 例1：https://localhost:3000/kbn/s/myspace/app/security -> 抓取 /s/myspace
+        m = re.search(r"/kbn(?:/[0-9a-fA-F]{6,})?(/s/[^/]+)\b", ref)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
 def _copy_response_headers(src: httpx.Response, dst: Response, request_host: Optional[str] = None, request_scheme: Optional[str] = None, strip_encoding_length: bool = False):
     # 將 Kibana 的 Set-Cookie 透傳給瀏覽器，其餘安全相關會影響 iframe 的標頭予以移除/覆寫
     # 注意：實務上建議在前置 Proxy（如 Nginx/Ingress）層處理
@@ -337,11 +411,12 @@ def _copy_response_headers(src: httpx.Response, dst: Response, request_host: Opt
     if strip_encoding_length:
         blocked.update({"content-encoding", "content-length"})
 
-    # Set-Cookie 需逐一追加
+    # Set-Cookie 去重並正規化後逐一追加
     try:
         set_cookies = src.headers.get_list("set-cookie")
-        for c in set_cookies:
-            dst.headers.append("set-cookie", _rewrite_set_cookie(c, new_domain=None, force_insecure=(request_scheme != "https")))
+        normalized = _dedupe_and_rewrite_set_cookies(set_cookies, new_domain=None, force_insecure=(request_scheme != "https"))
+        for c in normalized:
+            dst.headers.append("set-cookie", c)
     except Exception:
         pass
 
@@ -374,6 +449,29 @@ def _copy_response_headers(src: httpx.Response, dst: Response, request_host: Opt
         dst.headers[k] = v
 
 
+def _relax_csp_frame_ancestors(csp_value: str) -> str:
+    """將 CSP 的 frame-ancestors 指令放寬，允許本地前端開發來源。
+    - 若已存在 frame-ancestors，覆蓋為允許 'self'、https://localhost:3000、https://127.0.0.1:3000
+    - 若不存在，則追加該指令到最後。
+    僅調整 frame-ancestors，其餘指令保持不變（避免破壞 nonce/script-src）。
+    """
+    try:
+        allowed = "frame-ancestors 'self' https://localhost:3000 https://127.0.0.1:3000"
+        # 標準化：以分號分割 directive
+        parts = [p.strip() for p in csp_value.split(';') if p.strip()]
+        replaced = False
+        for i, p in enumerate(parts):
+            if p.lower().startswith('frame-ancestors'):
+                parts[i] = allowed
+                replaced = True
+                break
+        if not replaced:
+            parts.append(allowed)
+        return '; '.join(parts)
+    except Exception:
+        return csp_value
+
+
 @app.api_route("/kbn/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], include_in_schema=False)
 async def kibana_proxy(path: str, request: Request):
     """
@@ -382,7 +480,14 @@ async def kibana_proxy(path: str, request: Request):
     """
     # 特例：若 /kbn/{hash}/internal/* 或 /kbn/{hash}/api/*，需改投遞到 Kibana 的真正 /internal/* 或 /api/*
     hashed_api_match = re.match(r"^(?P<prefix>[0-9a-fA-F]{6,})/(internal|api)/(?P<rest>.*)$", path)
-    if hashed_api_match:
+    # 也支援含 Space 的情況：s/{space}/{hash}/(internal|api)/...
+    space_hash_api_match = re.match(r"^s/(?P<space>[^/]+)/(?P<prefix>[0-9a-fA-F]{6,})/(?P<kind>internal|api)/(?P<rest>.*)$", path)
+    if space_hash_api_match:
+        kind = space_hash_api_match.group("kind")
+        rest = space_hash_api_match.group("rest")
+        space = space_hash_api_match.group("space")
+        target_url = f"{settings.KBN_URL}/s/{space}/{kind}/{rest}"
+    elif hashed_api_match:
         kind = path.split("/", 1)[1].split("/", 1)[0]  # internal 或 api
         rest = hashed_api_match.group("rest")
         target_url = f"{settings.KBN_URL}/{kind}/{rest}"
@@ -499,6 +604,10 @@ async def kibana_proxy(path: str, request: Request):
     try:
         csp = r.headers.get("content-security-policy", "")
         if csp:
+            # 若為 HTML 回應且允許放寬，調整 frame-ancestors 以允許本地嵌入
+            if settings.RELAX_KBN_CSP and ("text/html" in ct):
+                relaxed = _relax_csp_frame_ancestors(csp)
+                resp.headers["Content-Security-Policy"] = relaxed
             resp.headers["X-Upstream-CSP"] = csp[:2048]  # 避免過長
     except Exception:
         pass
@@ -528,11 +637,12 @@ async def kibana_proxy(path: str, request: Request):
 # 轉發帶雜湊前綴的 /{hash}/internal/* 到真正的 /internal/*（Kibana 可能在前端以 basePath 帶上 hash）
 @app.api_route("/{prefix}/internal/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], include_in_schema=False)
 async def kibana_hashed_internal_proxy(prefix: str, path: str, request: Request):
-    # 僅接受十六進位雜湊前綴，避免誤攔截其他路徑
+    # 僅接受十六進位雜湊前綴；若不是雜湊，改委派到一般的 /internal/* 代理，避免誤攔截
     if not re.fullmatch(r"[0-9a-fA-F]{6,}", prefix):
-        raise HTTPException(404, "Not Found")
+        return await kibana_internal_proxy(path, request)
 
-    target_url = f"{settings.KBN_URL}/internal/{path}"
+    space_prefix = _space_prefix_from_request(request)
+    target_url = f"{settings.KBN_URL}{space_prefix}/internal/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
 
@@ -580,11 +690,18 @@ async def kibana_hashed_internal_proxy(prefix: str, path: str, request: Request)
         if "text/html" in ct:
             resp.headers["X-Proxy-HTML"] = "1"
         resp.headers["X-Upstream-CT"] = ct
+        if r.status_code >= 400:
+            try:
+                snippet = r.text[:512]
+                resp.headers["X-Upstream-Err"] = snippet
+            except Exception:
+                pass
     except Exception:
         pass
     try:
         if (r.status_code >= 300) or ("text/html" in r.headers.get("content-type", "")):
-            print(f"[proxy] HASHED INTERNAL -> HTML or non-2xx: {settings.KBN_URL}/internal/{path} status={r.status_code} ct={r.headers.get('content-type','')} loc={r.headers.get('location','')} ")
+            up_path = f"/internal/{path}"
+            print(f"[proxy] HASHED INTERNAL -> HTML or non-2xx: {settings.KBN_URL}{up_path} status={r.status_code} ct={r.headers.get('content-type','')} loc={r.headers.get('location','')} ")
     except Exception:
         pass
     return resp
@@ -593,10 +710,16 @@ async def kibana_hashed_internal_proxy(prefix: str, path: str, request: Request)
 # 轉發帶雜湊前綴的 /{hash}/api/* 到真正的 /api/*
 @app.api_route("/{prefix}/api/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], include_in_schema=False)
 async def kibana_hashed_api_proxy(prefix: str, path: str, request: Request):
+    # 非雜湊前綴（例如 '/api/...') 被此路由搶到時，委派給一般 /api/* 代理
     if not re.fullmatch(r"[0-9a-fA-F]{6,}", prefix):
-        raise HTTPException(404, "Not Found")
+        # 特別處理 '/internal/api/...' 被此路由搶到的情況，交回 internal 代理
+        if prefix.lower() == "internal":
+            return await kibana_internal_proxy(path, request)
+        return await kibana_api_proxy_catchall(path, request)
 
-    target_url = f"{settings.KBN_URL}/api/{path}"
+    space_prefix = _space_prefix_from_request(request)
+    # 直通，不做任何 exception_lists 重寫
+    target_url = f"{settings.KBN_URL}{space_prefix}/api/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
 
@@ -628,13 +751,14 @@ async def kibana_hashed_api_proxy(prefix: str, path: str, request: Request):
         fwd_headers["Accept-Encoding"] = "identity"
         fwd_headers.setdefault("kbn-xsrf", "true")
         fwd_headers.setdefault("X-Requested-With", "XMLHttpRequest")
-        r = await client.request(request.method, target_url, headers=fwd_headers, content=body)
+    r = await client.request(request.method, target_url, headers=fwd_headers, content=body)
 
     resp = Response(content=r.content, status_code=r.status_code)
     orig_scheme = request.headers.get("x-forwarded-proto") or ("https" if request.headers.get("origin", "").startswith("https://") else request.url.scheme)
     _copy_response_headers(r, resp, request.url.hostname, orig_scheme)
     resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Upstream-URL"] = f"/api/{path}"
+    up_path = target_url.replace(settings.KBN_URL, "")
+    resp.headers["X-Upstream-URL"] = up_path
     # Debug headers
     try:
         if request.headers.get("cookie"):
@@ -643,11 +767,18 @@ async def kibana_hashed_api_proxy(prefix: str, path: str, request: Request):
         if "text/html" in ct:
             resp.headers["X-Proxy-HTML"] = "1"
         resp.headers["X-Upstream-CT"] = ct
+        if r.status_code >= 400:
+            try:
+                snippet = r.text[:512]
+                resp.headers["X-Upstream-Err"] = snippet
+            except Exception:
+                pass
     except Exception:
         pass
     try:
         if (r.status_code >= 300) or ("text/html" in r.headers.get("content-type", "")):
-            print(f"[proxy] HASHED API -> HTML or non-2xx: {settings.KBN_URL}/api/{path} status={r.status_code} ct={r.headers.get('content-type','')} loc={r.headers.get('location','')} ")
+            up_path = target_url.replace(settings.KBN_URL, "")
+            print(f"[proxy] HASHED API -> HTML or non-2xx: {settings.KBN_URL}{up_path} status={r.status_code} ct={r.headers.get('content-type','')} loc={r.headers.get('location','')} ")
     except Exception:
         pass
     return resp
@@ -656,7 +787,9 @@ async def kibana_hashed_api_proxy(prefix: str, path: str, request: Request):
 # 轉發 Kibana root 路徑下的 /internal/*（iframe 內的 XHR 常走這個 prefix）
 @app.api_route("/internal/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], include_in_schema=False)
 async def kibana_internal_proxy(path: str, request: Request):
-    target_url = f"{settings.KBN_URL}/internal/{path}"
+    # 直通 Internal API，不再嘗試將 exception_lists 改寫成公開 API。
+    space_prefix = _space_prefix_from_request(request)
+    target_url = f"{settings.KBN_URL}{space_prefix}/internal/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
 
@@ -696,7 +829,12 @@ async def kibana_internal_proxy(path: str, request: Request):
     _copy_response_headers(r, resp, request.url.hostname, orig_scheme)
     # API 通常不需快取
     resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Upstream-URL"] = f"/internal/{path}"
+    try:
+        # 回傳實際上游 URL 以利除錯
+        up_path = target_url.replace(settings.KBN_URL, "")
+        resp.headers["X-Upstream-URL"] = up_path
+    except Exception:
+        resp.headers["X-Upstream-URL"] = f"/internal/{path}"
     try:
         if request.headers.get("cookie"):
             resp.headers["X-Proxy-Has-Cookie"] = "1"
@@ -704,11 +842,18 @@ async def kibana_internal_proxy(path: str, request: Request):
         if "text/html" in ct:
             resp.headers["X-Proxy-HTML"] = "1"
         resp.headers["X-Upstream-CT"] = ct
+        if r.status_code >= 400:
+            try:
+                snippet = r.text[:512]
+                resp.headers["X-Upstream-Err"] = snippet
+            except Exception:
+                pass
     except Exception:
         pass
     try:
         if (r.status_code >= 300) or ("text/html" in r.headers.get("content-type", "")):
-            print(f"[proxy] INTERNAL -> HTML or non-2xx: {settings.KBN_URL}/internal/{path} status={r.status_code} ct={r.headers.get('content-type','')} loc={r.headers.get('location','')} ")
+            up_path = target_url.replace(settings.KBN_URL, "") if 'target_url' in locals() else f"/internal/{path}"
+            print(f"[proxy] INTERNAL -> HTML or non-2xx: {settings.KBN_URL}{up_path} status={r.status_code} ct={r.headers.get('content-type','')} loc={r.headers.get('location','')} ")
     except Exception:
         pass
     return resp
@@ -718,7 +863,9 @@ async def kibana_internal_proxy(path: str, request: Request):
 @app.api_route("/api/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], include_in_schema=False)
 async def kibana_api_proxy_catchall(path: str, request: Request):
     # 避免誤轉發本應由本服務處理的 API，可加上白名單/黑名單；這裡先簡化交由路由優先級處理。
-    target_url = f"{settings.KBN_URL}/api/{path}"
+    space_prefix = _space_prefix_from_request(request)
+    # 直通公開 API，不做任何 exception_lists 重寫
+    target_url = f"{settings.KBN_URL}{space_prefix}/api/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
 
@@ -758,7 +905,8 @@ async def kibana_api_proxy_catchall(path: str, request: Request):
     _copy_response_headers(r, resp, request.url.hostname, orig_scheme)
     # API 通常不需快取
     resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Upstream-URL"] = f"/api/{path}"
+    up_path = target_url.replace(settings.KBN_URL, "")
+    resp.headers["X-Upstream-URL"] = up_path
     try:
         if request.headers.get("cookie"):
             resp.headers["X-Proxy-Has-Cookie"] = "1"
@@ -766,13 +914,69 @@ async def kibana_api_proxy_catchall(path: str, request: Request):
         if "text/html" in ct:
             resp.headers["X-Proxy-HTML"] = "1"
         resp.headers["X-Upstream-CT"] = ct
+        if r.status_code >= 400:
+            try:
+                snippet = r.text[:512]
+                resp.headers["X-Upstream-Err"] = snippet
+            except Exception:
+                pass
     except Exception:
         pass
     try:
         if (r.status_code >= 300) or ("text/html" in r.headers.get("content-type", "")):
-            print(f"[proxy] API -> HTML or non-2xx: {settings.KBN_URL}/api/{path} status={r.status_code} ct={r.headers.get('content-type','')} loc={r.headers.get('location','')} ")
+            up_path = target_url.replace(settings.KBN_URL, "")
+            print(f"[proxy] API -> HTML or non-2xx: {settings.KBN_URL}{up_path} status={r.status_code} ct={r.headers.get('content-type','')} loc={r.headers.get('location','')} ")
     except Exception:
         pass
+    return resp
+
+
+# 代理 Kibana 的 i18n 翻譯資源：/translations/{hash}/{lang}.json
+@app.api_route("/translations/{prefix}/{rest:path}", methods=["GET", "HEAD"], include_in_schema=False)
+async def kibana_translations(prefix: str, rest: str, request: Request):
+    # hash 一樣採 6+ 位十六進位
+    if not re.fullmatch(r"[0-9a-fA-F]{6,}", prefix):
+        raise HTTPException(404, "Not Found")
+
+    target_url = f"{settings.KBN_URL}/translations/{prefix}/{rest}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
+
+    hop_by_hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+                  "te", "trailers", "transfer-encoding", "upgrade"}
+    fwd_headers = {}
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk in hop_by_hop or lk == "host" or lk in {"if-none-match", "if-modified-since", "if-match", "if-unmodified-since"}:
+            continue
+        fwd_headers[k] = v
+    try:
+        orig = request.headers.get("origin")
+        orig_scheme = request.headers.get("x-forwarded-proto") or ("https" if (orig and orig.startswith("https://")) else request.url.scheme)
+        fwd_headers["X-Forwarded-Proto"] = orig_scheme
+        host_hdr = request.headers.get("host")
+        if orig:
+            parts = urlsplit(orig)
+            host_hdr = parts.hostname if parts.hostname else host_hdr
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+            fwd_headers["X-Forwarded-Port"] = str(port)
+        if host_hdr:
+            fwd_headers["X-Forwarded-Host"] = host_hdr
+    except Exception:
+        pass
+
+    # 避免壓縮/長度不一致
+    fwd_headers["Accept-Encoding"] = "identity"
+
+    async with httpx.AsyncClient(verify=settings.VERIFY_TLS, timeout=30, follow_redirects=False) as client:
+        r = await client.request(request.method, target_url, headers=fwd_headers)
+
+    resp = Response(content=r.content, status_code=r.status_code)
+    orig_scheme = request.headers.get("x-forwarded-proto") or ("https" if request.headers.get("origin", "").startswith("https://") else request.url.scheme)
+    _copy_response_headers(r, resp, request.url.hostname, orig_scheme)
+    # 翻譯檔通常可快取，但為避免開發期混淆，先不快取
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Upstream-URL"] = f"/translations/{prefix}/{rest}"
     return resp
 
 
@@ -834,3 +1038,4 @@ async def kibana_hashed_assets(prefix: str, rest: str, request: Request):
         resp.headers["Cache-Control"] = "no-store"
     # 對 JS/CSS/字型等資產，若仍需防止舊快取，可視情況設定 no-store；先保守不改，除非發現仍拿舊版
     return resp
+
