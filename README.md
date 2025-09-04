@@ -4,9 +4,12 @@
 
 ## 目錄
 - [安裝與啟動](#安裝與啟動)
+- [快速開始（Windows）](#快速開始windows)
+- [Docker 部署](#docker-部署)
+- [本機 HTTPS（Windows / mkcert）](#本機-httpswindows--mkcert)
 - [環境變數設定](#環境變數設定)
 - [API 端點說明](#api-端點說明)
-- [前端串接範例](#前端串接範例-Vue3-CoreUI)
+- [前端串接範例（Vue3 + CoreUI）](#前端串接範例vue3--coreui)
 - [注意事項](#注意事項)
 
 ---
@@ -25,16 +28,125 @@
 
 ---
 
+## 快速開始（Windows）
+
+1. 安裝依賴（於專案根目錄）
+  ```powershell
+  pip install -r .\requirements.txt
+  ```
+2. 設定環境變數（依你的環境調整）
+  ```powershell
+  $env:ES_URL = 'https://127.0.0.1:9200'
+  $env:KBN_URL = 'https://127.0.0.1:5601'
+  $env:VERIFY_TLS = 'false'  # 若自簽證書或開發環境
+  ```
+3. 啟動（預設 8000）
+  ```powershell
+  uvicorn app:app --host 0.0.0.0 --port 8000
+  ```
+4. 簡單測試
+  ```powershell
+  # 健康檢查
+  Invoke-RestMethod -Uri 'http://127.0.0.1:8000/healthz'
+
+  # 登入（請替換帳密）
+  $body = @{ username = 'elastic'; password = 'your-password' } | ConvertTo-Json
+  Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8000/api/login' -ContentType 'application/json' -Body $body
+  ```
+
+---
+
+## Docker 部署
+
+1. 建置映像
+  ```powershell
+  docker build -t loginapi:latest .
+  ```
+2. 執行容器（服務埠 8080，見 Dockerfile）
+  ```powershell
+  docker run --rm -p 8080:8080 `
+    -e ES_URL='https://your-es:9200' `
+    -e KBN_URL='https://your-kibana:5601' `
+    -e VERIFY_TLS='false' `
+    -e ISSUE_SERVER_JWT='true' `
+    -e SERVER_JWT_SECRET='change-me' `
+    -e SERVER_JWT_EXPIRE_DAYS='7' `
+    -e ES_GRANT_FLOW='token' `
+    -e KBN_PROVIDER_NAME='basic' `
+    -e RELAX_KBN_CSP='true' `
+    loginapi:latest
+  ```
+3. 測試
+  ```powershell
+  Invoke-RestMethod -Uri 'http://127.0.0.1:8080/healthz'
+  ```
+
+---
+
+## 本機 HTTPS（Windows / mkcert）
+
+目的：在開發機上讓前端（CoreUI/Vite）以 HTTPS 執行，便於使用 Secure Cookie、部分瀏覽器功能（如 COOP/COEP）與更貼近實際環境。
+
+1) 安裝 Chocolatey 與 mkcert（以系統管理員 PowerShell 執行）
+
+```powershell
+# 安裝 Chocolatey（若你在 cmd 環境，可使用以下一行指令）
+@"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -InputFormat None -ExecutionPolicy Bypass -Command "iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))" && SET "PATH=%PATH%;%ALLUSERSPROFILE%\chocolatey\bin"
+
+# 安裝 mkcert
+choco install -y mkcert
+
+# 安裝/註冊本機信任 CA（只需一次）
+mkcert -install
+```
+
+2) 產生本機憑證（供 Vite 使用）
+
+```powershell
+mkcert localhost 127.0.0.1
+# 會產生兩個檔案：一個不帶 key 後綴（憑證），一個帶 key 後綴（私鑰）
+```
+
+3) 重新命名並放置於前端專案
+
+- 將無 key 後綴的檔案改名為 `dev.crt`
+- 將帶 key 後綴的檔案改名為 `dev.key`
+- 建立前端專案目錄 `coreui-kibana/cert/`，把兩個檔案放入其中
+
+4) 啟動前端（Vite）為 HTTPS
+
+```powershell
+# PowerShell 設定環境變數後啟動
+VITE_HTTPS=1 npm run dev
+```
+
 ## 環境變數設定
-可於 `settings.py` 設定下列參數：
-| 變數名稱              | 預設值                    | 說明 |
-|----------------------|---------------------------|------|
-| ES_URL               | https://elasticsearch節點IP:9200| Elasticsearch 伺服器位址 |
-| KBN_URL              | http://kibana節點IP:5601        | Kibana 伺服器位址 |
-| VERIFY_TLS           | false                     | 是否驗證 TLS 憑證 |
-| ISSUE_SERVER_JWT     | true                      | 是否啟用 Server JWT 模式 |
-| SERVER_JWT_SECRET    | change-me                 | JWT 簽章密鑰 |
-| SERVER_JWT_EXPIRE_DAYS | 7                        | JWT 有效天數 |
+服務透過環境變數讀取設定（見 `settings.py`）。以下為可用參數：
+
+| 變數名稱               | 預設值                 | 說明 |
+|-----------------------|------------------------|------|
+| ES_URL                | https://127.0.0.1:9200 | Elasticsearch URL |
+| KBN_URL               | https://127.0.0.1:5601 | Kibana URL |
+| VERIFY_TLS            | false                  | 是否驗證 TLS 憑證（自簽/開發環境可設 false） |
+| KBN_PROVIDER_NAME     | basic                  | Kibana provider 名稱（Elastic 常見為 basic 或 cloud-basic） |
+| ES_GRANT_FLOW         | token                  | 取得 API Key 的流程：token 或 password；若 token 失敗會自動回退 password |
+| ISSUE_SERVER_JWT      | true                   | 是否只將自家 JWT 給前端，ES API Key 僅存後端 |
+| SERVER_JWT_SECRET     | change-me              | 自家 JWT 簽章密鑰（請務必更改） |
+| SERVER_JWT_EXPIRE_DAYS| 7                      | 自家 JWT 有效天數 |
+| RELAX_KBN_CSP         | true                   | 開發時鬆綁部分標頭以利 iframe 與內嵌啟動 |
+
+範例 .env（可供 Docker Compose 或其他方式載入）
+```dotenv
+ES_URL=https://127.0.0.1:9200
+KBN_URL=https://127.0.0.1:5601
+VERIFY_TLS=false
+ISSUE_SERVER_JWT=true
+SERVER_JWT_SECRET=change-me
+SERVER_JWT_EXPIRE_DAYS=7
+ES_GRANT_FLOW=token
+KBN_PROVIDER_NAME=basic
+RELAX_KBN_CSP=true
+```
 
 ---
 
@@ -69,11 +181,10 @@
     "expiresInDays": 7
   }
   ```
-- 測試端點：
+- 測試端點（PowerShell）：
   ```powershell
-  curl -sS -X POST http://127.0.0.1:8000/api/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"elastic帳號","password":"密碼"}'
+  $body = @{ username = 'elastic帳號'; password = '密碼' } | ConvertTo-Json
+  Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8000/api/login' -ContentType 'application/json' -Body $body
   ```
 
 - **說明**：
@@ -107,7 +218,7 @@
 
 ---
 
-## 前端串接範例 Vue3 CoreUI
+## 前端串接範例（Vue3 + CoreUI）
 
 以下示範以 CoreUI for Vue 建立基本頁面，並串接本 API 完成登入、取得 ES indices 與嵌入 Kibana。
 
